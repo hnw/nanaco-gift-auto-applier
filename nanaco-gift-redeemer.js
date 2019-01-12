@@ -1,9 +1,4 @@
-const puppeteer = require('puppeteer');
-const {TimeoutError} = require('puppeteer/Errors');
-const path = require('path');
-const os = require('os');
-const my = require(__dirname + '/common_functions.js');
-const scriptName = path.basename(__filename);
+require('dotenv').config();
 const yargs = require('yargs')
       .usage('Usage: $0 [options]')
       .boolean('debug')
@@ -12,7 +7,31 @@ const yargs = require('yargs')
       .version('0.0.1')
       .locale('en');
 const argv = yargs.argv;
-require('dotenv').config();
+
+let log4js_appenders;
+if (argv.debug) {
+  log4js_appenders = ['console_raw', 'result', 'debug'];
+} else {
+  log4js_appenders = ['console', 'result'];
+}
+
+const log4js = require('log4js');
+log4js.configure({
+  appenders: {
+    debug: { type: 'dateFile', filename: 'log/debug', alwaysIncludePattern: true, layout: { type: 'pattern', pattern: '[%d] [%p] %m' } },
+    result_raw: { type: 'dateFile', filename: 'log/result', alwaysIncludePattern: true, layout: { type: 'pattern', pattern: '[%d] [%p] %m' } },
+    console_raw: { type: 'console', layout: { type: 'messagePassThrough' } },
+    console: { type: 'logLevelFilter', appender: 'console_raw', level: 'info' },
+    result: { type: 'logLevelFilter', appender: 'result_raw', level: 'info' },
+  },
+  categories: { default: { appenders: log4js_appenders, level: 'debug' } }
+});
+const logger = log4js.getLogger();
+
+const puppeteer = require('puppeteer');
+const {TimeoutError} = require('puppeteer/Errors');
+const path = require('path');
+const scriptName = path.basename(__filename);
 const options = {
   "headless" : !(argv.debug),
   "slowMo" : 'SLOWMO' in process.env ? parseInt(process.env.SLOWMO, 10) : 200,
@@ -26,26 +45,35 @@ const options = {
   const browser = await puppeteer.launch(options);
   let page = await browser.newPage();
   if (argv.debug) {
-    page.on('console', msg => console.log('PAGE LOG:', msg.text()));
+    page.on('console', msg => logger.debug('PAGE LOG:', msg.text()));
   }
 
   try {
-    let addedPoint = 0;
+    let totalPoint = 0;
+    let nGift = 0;
     for (let giftId of argv._) {
       if (!giftId.match(/^[A-Za-z0-9]{16}$/)) {
-        console.log('Ignored nanaco Gift ID: '+giftId);
+        logger.warn(`与えられた引数はnanacoギフトのIDではないため無視しました: ${giftId}`);
         continue;
       }
       await login(page, giftId);
       await top(page);
-      addedPoint += await applyNanacoGift(page);
+      let addedPoint = await applyNanacoGift(page);
+      if (addedPoint > 0) {
+        nGift++;
+        totalPoint += addedPoint;
+      }
     }
-    console.log('累計 '+addedPoint+' 円分のnanacoギフトを登録しました。');
+    if (nGift <= 0) {
+      logger.error('有効なnanacoギフトIDが1つも指定されませんでした。');
+    } else {
+      logger.info(`計 ${nGift} 個、${totalPoint} 円分のnanacoギフトを登録しました。`);
+    }
 
     // ログインページ
     async function login(page, giftId) {
-      console.log('login()');
-      await my.goto(page, 'https://www.nanaco-net.jp/pc/emServlet?gid='+giftId);
+      logger.debug('login()');
+      await page.goto('https://www.nanaco-net.jp/pc/emServlet?gid='+giftId);
 
       const number = process.env.NANACO_NUMBER;
       const seccode = process.env.NANACO_SECCODE;
@@ -59,18 +87,18 @@ const options = {
         await page.type('input[name="LOGIN_PWD"]', password);
         await page.click('input[name="ACT_ACBS_do_LOGIN1"]');
       } else {
-        console.log('error');
+        throw new Error('ログインに失敗しました。.envを確認してください。');
       }
     }
     // topページ
     async function top(page) {
-      console.log('top()');
+      logger.debug('top()');
       page.waitForSelector('a[href*="_ActionID=ACBS_do_NNC_GIFT_REG"]', {visible: true}).then(el => el.click());
     }
 
     // nanacoギフトtopページ
     async function applyNanacoGift(page) {
-      console.log('nanacoGiftTop()');
+      logger.debug('nanacoGiftTop()');
       const button = await page.waitForSelector('input[type="image"]', {visible: true});
 
       let newPage;
@@ -86,10 +114,10 @@ const options = {
       // ギフトID登録内容確認（ID登録済みの場合は表示されない）
       let table = await newPage.waitForSelector('table.form', {visible: true})
       const th = await table.$$('th');
-      let alreadyApplied = false; // 登録済み
+      let alreadyRedeemed = false; // 登録済み
       if (th.length == 2) {
         // ギフトID登録内容確認
-        console.log('ギフトID登録内容確認');
+        logger.debug('ギフトID登録内容確認');
         const button = await newPage.$('form#registerForm input[type="image"]');
         await Promise.all([
           newPage.waitForNavigation({waitUntil: "domcontentloaded"}),
@@ -97,32 +125,31 @@ const options = {
         ]);
         table = await newPage.waitForSelector('table.form', {visible: true})
       } else if (th.length == 5) {
-        console.log('ギフトID登録済み');
-        alreadyApplied = true;
+        logger.debug('ギフトID登録済み');
+        alreadyRedeemed = true;
       } else {
         throw new Error('ギフトID情報の行数がおかしい');
       }
       // ギフトID登録完了ページ
-      console.log('ギフトID登録完了');
+      logger.debug('ギフトID登録完了');
       let addedPoints = 0;
-      if (!alreadyApplied) {
+      if (!alreadyRedeemed) {
         addedPoints = await table.$eval('tr:nth-child(3) td', el => parseInt(el.textContent.replace(/円$/g, ' '), 10));
-        console.log(addedPoints);
       }
       let result = await table.$eval('tbody', el => el.textContent.replace(/[,\s]+/g, ' '));
-      console.log(result);
+      if (alreadyRedeemed) {
+        logger.warn('[登録済]' + result);
+      } else {
+        logger.info('[登録成功]' + result);
+      }
       await newPage.close(); // 新ウインドウを消す
       return addedPoints;
     }
   } catch (e) {
-    console.log(e);
-    my.postError(e);
-    await my.postUrls(browser);
-    await my.uploadScreenShot(page, 'error.png');
+    logger.error(e);
   } finally {
-    if (argv.debug) {
-      console.log('The script is finished.');
-    } else {
+    logger.debug('The script is finished.');
+    if (!argv.debug) {
       await browser.close();
     }
   }
